@@ -1,25 +1,28 @@
 {
-  "name": "elevenlabs-twilio-call-llm",
-  "main": "index.js",
-  "type": "module",
-  "scripts": {
-    "start": "node index.js",
-    "ngrok": "ngrok http 5000"
-  },
-  "dependencies": {
-    "axios": "^1.6.8",
-    "colors": "^1.4.0",
-    "dotenv": "^16.4.5",
-    "express": "^4.18.3",
-    "express-ws": "^5.0.2",
-    "openai": "^4.29.2",
-    "twilio": "^5.0.1",
-    "uuid": "^9.0.1",
-    "ws": "^8.16.0"
-  },
-  "author": "ElevenLabs",
-  "license": "MIT",
-  "keywords": [
-    "elevenlabs"
-  ]
+    "name": "elevenlabs-twilio-call-llm",
+    "main": "index.js",
+    "type": "module",
+    "scripts": {
+        "start": "node index.js",
+        "ngrok": "ngrok http 5000"
+    },
+    "dependencies": {
+        "@fastify/formbody": "^8.0.2",
+        "@fastify/websocket": "^11.1.0",
+        "axios": "^1.6.8",
+        "colors": "^1.4.0",
+        "dotenv": "^16.4.5",
+        "express": "^4.18.3",
+        "express-ws": "^5.0.2",
+        "fastify": "^5.4.0",
+        "openai": "^4.29.2",
+        "twilio": "^5.0.1",
+        "uuid": "^9.0.1",
+        "ws": "^8.16.0"
+    },
+    "author": "ElevenLabs",
+    "license": "MIT",
+    "keywords": [
+        "elevenlabs"
+    ]
 }
