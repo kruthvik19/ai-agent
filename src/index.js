@@ -121,9 +121,9 @@ fastify.register(async function (fastify) {
 });
 
 try {
-  fastify.listen({ port: PORT });
+  await fastify.listen({ port: PORT, host: "0.0.0.0" });
   console.log(
-    `Server running at http://localhost:${PORT} and wss://${DOMAIN}/ws`
+    `Server running at http://0.0.0.0:${PORT} and wss://${DOMAIN}/ws`
   );
 } catch (err) {
   fastify.log.error(err);
