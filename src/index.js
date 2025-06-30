@@ -40,20 +40,11 @@ fastify.all("/twiml", async (request, reply) => {
     `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
       <Connect>
-        <ConversationRelay
-          url="${WS_URL}"
-          ttsProvider="ElevenLabs"
-          voice="ZF6FPAbjXT4488VcRRnw-flash_v2_5-1.2_1.0_1.0"
-          elevenlabsTextNormalization="on"
-          welcomeGreeting="${WELCOME_GREETING}"
-          record="record-from-answer"
-          recordingTrack="both_tracks"
-        />
+        <ConversationRelay url="${WS_URL}" ttsProvider="ElevenLabs" voice="ZF6FPAbjXT4488VcRRnw-flash_v2_5-1.2_1.0_1.0" elevenlabsTextNormalization="on" welcomeGreeting="${WELCOME_GREETING}"/>
       </Connect>
     </Response>`
   );
 });
-
 
 // API to initiate outbound call
 fastify.post("/call-me", async (request, reply) => {
@@ -68,7 +59,6 @@ fastify.post("/call-me", async (request, reply) => {
       to: toNumber,
       from: process.env.TWILIO_PHONE_NUMBER,
       url: `https://${DOMAIN}/twiml`,
-      record: true,
       recordingChannels: 'dual',
     });
 
