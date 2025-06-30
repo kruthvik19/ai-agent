@@ -3,9 +3,9 @@ import fastifyWs from "@fastify/websocket";
 import fastifyFormBody from "@fastify/formbody";
 import Twilio from "twilio";
 import OpenAI from "openai";
+import cors from "@fastify/cors";
 import dotenv from "dotenv";
 dotenv.config();
-
 const twilioClient = Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const PORT = process.env.PORT || 8080;
 const DOMAIN = process.env.NGROK_URL;
@@ -28,6 +28,13 @@ async function aiResponse(messages) {
 const fastify = Fastify();
 fastify.register(fastifyWs);
 fastify.register(fastifyFormBody);
+
+await fastify.register(cors, {
+  origin: "*",
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
+});
 fastify.all("/twiml", async (request, reply) => {
   reply.type("text/xml").send(
     `<?xml version="1.0" encoding="UTF-8"?>
