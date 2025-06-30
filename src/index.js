@@ -41,13 +41,17 @@ fastify.all("/twiml", async (request, reply) => {
 
 // API to initiate outbound call
 fastify.post("/call-me", async (request, reply) => {
-  const toNumber = "+919071352311"; // your target number
+  const { number: toNumber } = request.body;
+
+  if (!toNumber || !/^\+\d+$/.test(toNumber)) {
+    return reply.code(400).send({ error: "Invalid or missing 'number'" });
+  }
 
   try {
     const call = await twilioClient.calls.create({
       to: toNumber,
       from: process.env.TWILIO_PHONE_NUMBER,
-      url: `https://${DOMAIN}/twiml`, // Twilio will fetch your /twiml
+      url: `https://${DOMAIN}/twiml`,
     });
 
     console.log(`📞 Outbound call initiated to ${toNumber}. SID: ${call.sid}`);
@@ -62,6 +66,7 @@ fastify.post("/call-me", async (request, reply) => {
     reply.code(500).send({ error: "Failed to create call", details: err.message });
   }
 });
+
 
 fastify.register(async function (fastify) {
   fastify.get("/ws", { websocket: true }, (ws, req) => {
