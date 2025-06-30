@@ -4,7 +4,6 @@
     "type": "module",
     "scripts": {
         "start": "node src/index.js"
-        "ngrok": "ngrok http 5000"
     },
     "dependencies": {
         "@fastify/formbody": "^8.0.2",
