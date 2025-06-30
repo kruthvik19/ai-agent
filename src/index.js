@@ -59,6 +59,7 @@ fastify.post("/call-me", async (request, reply) => {
       to: toNumber,
       from: process.env.TWILIO_PHONE_NUMBER,
       url: `https://${DOMAIN}/twiml`,
+       record: true, 
       recordingChannels: 'dual',
     });
 
