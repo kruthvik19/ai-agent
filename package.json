@@ -3,7 +3,7 @@
     "main": "index.js",
     "type": "module",
     "scripts": {
-        "start": "node index.js",
+        "start": "node src/index.js"
         "ngrok": "ngrok http 5000"
     },
     "dependencies": {
