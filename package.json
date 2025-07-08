@@ -8,7 +8,9 @@
     "dependencies": {
         "@fastify/cors": "^11.0.1",
         "@fastify/formbody": "^8.0.2",
+        "@fastify/multipart": "^9.0.3",
         "@fastify/websocket": "^11.1.0",
+        "@pinecone-database/pinecone": "^6.1.1",
         "axios": "^1.6.8",
         "colors": "^1.4.0",
         "cors": "^2.8.5",
@@ -16,7 +18,9 @@
         "express": "^4.18.3",
         "express-ws": "^5.0.2",
         "fastify": "^5.4.0",
+        "mammoth": "^1.9.1",
         "openai": "^4.29.2",
+        "pdf-parse": "^1.1.1",
         "twilio": "^5.0.1",
         "uuid": "^9.0.1",
         "ws": "^8.16.0"
