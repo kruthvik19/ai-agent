@@ -5,24 +5,29 @@ import Twilio from "twilio";
 import OpenAI from "openai";
 import cors from "@fastify/cors";
 import dotenv from "dotenv";
-import fs from "fs";
 import workflowRoutes from '../routes/workflowRoutes.js';
 import workflowController from '../controllers/workflowController.js';
 import workflowModel from '../models/workflowModel.js';
 dotenv.config();
- 
+
 const { Pinecone } = await import("@pinecone-database/pinecone");
- 
+
 const pinecone = new Pinecone();
 const index = pinecone.Index("knowledge-base");
- 
-// OpenAI client
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
- 
+
 const PORT = process.env.PORT || 8080;
 const DOMAIN = process.env.NGROK_URL;
- 
-const fastify = Fastify();
+
+const fastify = Fastify({
+  logger: true,
+  maxParamLength: 1024,
+  requestTimeout: 10000,
+  keepAliveTimeout: 65 * 1000,
+});
+fastify.addHook('onRequest', async (request, reply) => {
+  reply.header('Cache-Control', 'no-store');
+});
 fastify.register(fastifyWs);
 fastify.register(fastifyFormBody);
 await fastify.register(cors, {
@@ -31,144 +36,121 @@ await fastify.register(cors, {
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
 });
- 
-// In-memory stores
+
 const sessions = new Map();
 const callSettings = new Map();
- 
-// Helper to get active workflow for an agent
+const embeddingCache = new Map();
+
 async function getActiveWorkflowForAgent(agentId) {
-  // Direct function call instead of HTTP request
   const workflow = await workflowController.getActiveWorkflowForAgent(agentId);
- 
-  if (workflow) {
-    // Get the full workflow with nodes and edges
-    return await workflowModel.getWorkflowWithNodesAndEdges(workflow.id);
-  }
- 
-  return null;
+  return workflow ? await workflowModel.getWorkflowWithNodesAndEdges(workflow.id) : null;
 }
- 
-// Helper to determine next node based on response
+
 function determineNextNode(workflow, currentNodeId, response, userInput) {
   const currentNode = workflow.nodes.find(n => n.id === currentNodeId);
   if (!currentNode) return null;
- 
-  // Find edges from current node
   const outgoingEdges = workflow.edges.filter(e => e.from_node_id === currentNodeId);
- 
-  // If only one edge, follow it
-  if (outgoingEdges.length === 1) {
-    return outgoingEdges[0].to_node_id;
-  }
- 
-  // If multiple edges, evaluate conditions
+  if (outgoingEdges.length === 1) return outgoingEdges[0].to_node_id;
   for (const edge of outgoingEdges) {
-    if (edge.condition?.type === 'direct') {
-      return edge.to_node_id;
-    }
-    // Add basic intent matching
+    if (edge.condition?.type === 'direct') return edge.to_node_id;
     if (edge.condition?.intent && userInput.toLowerCase().includes(edge.condition.intent.toLowerCase())) {
       return edge.to_node_id;
     }
   }
- 
-  // Default to first edge if no conditions match
   return outgoingEdges[0]?.to_node_id || null;
 }
- 
-// Helper to extract variables based on plan
+
 async function extractVariables(text, plan) {
   if (!plan?.output || plan.output.length === 0) return {};
- 
   try {
     const prompt = `Extract the following variables from the text: ${JSON.stringify(plan.output)}
 Text: "${text}"
 Respond with only a JSON object containing the extracted variables.`;
-   
     const completion = await openai.chat.completions.create({
       model: "gpt-4",
       messages: [{ role: "user", content: prompt }],
       temperature: 0.1,
     });
-   
-    const response = completion.choices[0].message.content;
-    return JSON.parse(response);
+    return JSON.parse(completion.choices[0].message.content);
   } catch (error) {
     console.error('Error extracting variables:', error);
     return {};
   }
 }
- 
-// Helpers
-async function aiResponse(messages, model, temperature, maxTokens) {
-  const completion = await openai.chat.completions.create({
+
+async function aiResponse(ws, messages, model, temperature, maxTokens) {
+  const stream = await openai.chat.completions.create({
     model,
     temperature,
     max_tokens: maxTokens,
     messages,
+    stream: true,
   });
-  return completion.choices[0].message.content;
+  let fullMessage = "";
+  for await (const chunk of stream) {
+    const token = chunk.choices?.[0]?.delta?.content;
+    if (token) {
+      fullMessage += token;
+      ws.send(JSON.stringify({ type: "text", token, last: false }));
+    }
+  }
+  // ✅ End the stream clearly with last=true (don't repeat the whole response as a token)
+  ws.send(JSON.stringify({ type: "text", token: "", last: true }));
+  return fullMessage;
 }
- 
+
 async function embedText(text) {
+  const cacheKey = text.toLowerCase().trim();
+  if (embeddingCache.has(cacheKey)) return embeddingCache.get(cacheKey);
   const embed = await openai.embeddings.create({
     model: "text-embedding-3-small",
     input: text,
   });
-  return embed.data[0].embedding;
+  const result = embed.data[0].embedding;
+  embeddingCache.set(cacheKey, result);
+  return result;
 }
- 
-async function getRelevantChunks(query, agentId, topK = 2) {
-  const queryEmbedding = await embedText(query);
-  const results = await index.query({
-    vector: queryEmbedding,
-    topK,
-    includeMetadata: true,
-    filter: { agent_id: agentId },
-  });
-  return results.matches.map(match => match.metadata.content);
+
+async function preFetchAgentKnowledge(agentId) {
+  try {
+    const stats = await index.describeIndexStats();
+    const vectorCount = stats.namespaces[agentId]?.vectorCount || 1000;
+    const queryEmbedding = await embedText("general query");
+    const results = await index.query({
+      vector: queryEmbedding,
+      topK: Math.min(vectorCount, 5000),
+      includeMetadata: true,
+      filter: { agent_id: agentId },
+    });
+    return results.matches.map(match => ({
+      content: match.metadata.content,
+      embedding: match.values
+    }));
+  } catch (error) {
+    console.error('Error pre-fetching knowledge:', error);
+    return [];
+  }
 }
- 
-// Helper to execute actions defined in node config
+
 async function executeNodeActions(actions, extractedVariables, callSid) {
   if (!actions) return;
- 
   try {
     console.log('🔄 Executing actions:', actions);
-   
-    // Handle calendar invite action
-    if (actions.send_calendar_invite) {
-      console.log('📅 Sending calendar invite');
-      // Implementation for sending calendar invite using extracted variables
-    }
-   
-    // Handle CRM update action
-    if (actions.update_crm) {
-      console.log('💼 Updating CRM');
-      // Implementation for updating CRM with call details and extracted variables
-    }
-   
-    // Handle other action types as needed
+    if (actions.send_calendar_invite) console.log('📅 Sending calendar invite');
+    if (actions.update_crm) console.log('💼 Updating CRM');
   } catch (error) {
     console.error('❌ Error executing actions:', error);
   }
 }
- 
-// TwiML endpoint
+
 fastify.all("/twiml", async (request, reply) => {
   const callSid = request.body.CallSid || request.query.callSid;
-  console.log("📞 TwiML called with CallSid:", callSid);
- 
   const settings = callSettings.get(callSid);
- 
   if (!settings) {
     console.error("❌ Unknown CallSid:", callSid);
     return reply.code(400).send("Unknown CallSid.");
   }
- 
   const combinedVoice = `${settings.elevenLabsVoiceId}-${settings.elevenLabsSpeed}_${settings.elevenLabsStability}_${settings.elevenLabsSimilarityBoost}`;
- 
   reply.type("text/xml").send(
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -182,12 +164,12 @@ fastify.all("/twiml", async (request, reply) => {
       transcriberLanguage="${settings.transcriberLanguage}"
       transcriberModel="${settings.transcriberModel}"
       welcomeGreeting="${settings.firstMessage}"/>
+      intelligenceService
   </Connect>
 </Response>`
   );
 });
- 
-// Start call
+
 fastify.post("/call-me", async (request, reply) => {
   const {
     number: toNumber,
@@ -205,20 +187,19 @@ fastify.post("/call-me", async (request, reply) => {
     temperature,
     systemPrompt,
     firstMessage,
-    maxTokens
+    maxTokens,
+    agentId
   } = request.body;
- 
   if (!toNumber || !/^\+\d+$/.test(toNumber)) {
     return reply.code(400).send({ error: "Invalid or missing 'number'" });
   }
- 
   const client = Twilio(twilioAccountSid, twilioAuthToken);
- 
   try {
-    // Get active workflow for the agent
-    const workflow = await getActiveWorkflowForAgent(request.body.agentId);
+    const [workflow, knowledgeChunks] = await Promise.all([
+      getActiveWorkflowForAgent(agentId),
+      preFetchAgentKnowledge(agentId)
+    ]);
     const startNode = workflow?.nodes?.find(n => !workflow.edges.some(e => e.to_node_id === n.id));
-   
     const call = await client.calls.create({
       to: toNumber,
       from: twilioPhoneNumber,
@@ -226,9 +207,8 @@ fastify.post("/call-me", async (request, reply) => {
       record: true,
       recordingChannels: "dual",
     });
- 
     callSettings.set(call.sid, {
-      agentId: request.body.agentId,
+      agentId,
       elevenLabsVoiceId,
       elevenLabsSpeed,
       elevenLabsStability,
@@ -241,12 +221,13 @@ fastify.post("/call-me", async (request, reply) => {
       systemPrompt,
       firstMessage,
       maxTokens: parseInt(maxTokens, 10),
-      // Add workflow-related settings
-      workflow: workflow,
+      workflow,
       currentNodeId: startNode?.id,
-      extractedVariables: {}
+      extractedVariables: {},
+      knowledgeChunks,
+      twilioAccountSid,
+      twilioAuthToken
     });
- 
     console.log(`📞 Outbound call initiated to ${toNumber}. SID: ${call.sid}`);
     reply.send({ success: true, callSid: call.sid, to: toNumber });
   } catch (err) {
@@ -254,148 +235,100 @@ fastify.post("/call-me", async (request, reply) => {
     reply.code(500).send({ error: "Failed to create call", details: err.message });
   }
 });
- 
-// Endpoint to end a call
+
 fastify.post("/end-call/:callSid", async (request, reply) => {
   const { callSid } = request.params;
   const settings = callSettings.get(callSid);
- 
   if (!settings) {
     return reply.code(404).send({ error: "Call not found" });
   }
- 
   try {
-    const client = Twilio(request.body.twilioAccountSid, request.body.twilioAuthToken);
+    const client = Twilio(settings.twilioAccountSid, settings.twilioAuthToken);
     await client.calls(callSid).update({ status: 'completed' });
-   
     console.log(`📞 Call ${callSid} ended via API`);
     callSettings.delete(callSid);
     sessions.delete(callSid);
-   
     reply.send({ success: true, message: "Call ended successfully" });
   } catch (err) {
     console.error("❌ Failed to end call:", err);
     reply.code(500).send({ error: "Failed to end call", details: err.message });
   }
 });
- fastify.register(workflowRoutes, { prefix: '/api' });
-// WebSocket
+
+fastify.register(workflowRoutes, { prefix: '/api' });
+
 fastify.register(async function (fastify) {
   fastify.get("/ws", { websocket: true }, (ws, req) => {
     const callSid = req.query.callSid;
     const settings = callSettings.get(callSid);
- 
     if (!settings) {
       console.error("❌ Unknown callSid in WebSocket:", callSid);
       ws.close();
       return;
     }
- 
     ws.on("message", async (data) => {
-      console.log("💬 Raw message:", data);
       const message = JSON.parse(data);
- 
       switch (message.type) {
         case "setup":
           console.log("⚙️ Setup received for CallSid:", callSid);
           ws.callSid = callSid;
           sessions.set(callSid, []);
           break;
- 
         case 'prompt':
           console.log('🎤 Prompt:', message.voicePrompt);
           const conversation = sessions.get(callSid) || [];
           conversation.push({ role: 'user', content: message.voicePrompt });
-         
-          // Get current node from workflow
-          const { workflow, currentNodeId, extractedVariables } = settings;
+          const { workflow, currentNodeId, knowledgeChunks } = settings;
           const currentNode = workflow?.nodes?.find(n => n.id === currentNodeId);
-         
-          console.log('🔄 Current workflow node:', currentNode?.name);
-         
-          // Check if current node is an end_call type node
           if (currentNode?.type === 'end_call') {
-            console.log('🛑 End call node reached, terminating call');
-           
-            // Get node config
+            console.log('🛑 End call node reached');
             const nodeConfig = typeof currentNode.config === 'string'
               ? JSON.parse(currentNode.config)
               : currentNode.config;
-           
-            // Execute any actions defined in the end node
             if (nodeConfig.actions) {
               await executeNodeActions(nodeConfig.actions, settings.extractedVariables, callSid);
             }
-           
-            // Send final message before ending call
             const endMessage = nodeConfig.prompt || 'Thank you for your time. Goodbye!';
-           
-            ws.send(JSON.stringify({
-              type: "text",
-              token: endMessage,
-              last: true,
-              endCall: true  // Signal to client that call should end
-            }));
-           
-            // End the call via Twilio API
             try {
-              const twilioAccountSid = settings.twilioAccountSid;
-              const twilioAuthToken = settings.twilioAuthToken;
-              if (twilioAccountSid && twilioAuthToken) {
-                const client = Twilio(twilioAccountSid, twilioAuthToken);
-                await client.calls(callSid).update({ status: 'completed' });
-                console.log(`📞 Call ${callSid} ended via Twilio API`);
-              }
+              const client = Twilio(settings.twilioAccountSid, settings.twilioAuthToken);
+              await client.calls(callSid).update({ status: 'completed' });
+              console.log(`📞 Call ${callSid} ended via Twilio API`);
             } catch (err) {
               console.error("❌ Failed to end call via Twilio API:", err);
             }
-           
-            // Close the WebSocket after sending the final message
             setTimeout(() => {
               ws.close();
               callSettings.delete(callSid);
               sessions.delete(callSid);
-            }, 3000);  // Give time for the message to be processed
-           
-            return;  // Exit the handler
+            }, 3000);
+            return;
           }
-         
-          const relevantChunks = await getRelevantChunks(message.voicePrompt, settings.agentId, 2);
-          console.log('📌 Relevant chunks:', relevantChunks);
-          const topChunk = relevantChunks[0];
-         
-          // Build dynamic prompt with workflow context
+          const topChunk = settings.knowledgeChunks?.[0]?.content || '';
+          console.log('📌 Pre-fetched knowledge chunks used');
           let dynamicPrompt = settings.systemPrompt;
           if (currentNode) {
             const nodeConfig = typeof currentNode.config === 'string'
               ? JSON.parse(currentNode.config)
               : currentNode.config;
-             
             dynamicPrompt += `\n\nCurrent Step: ${currentNode.name}`;
-            if (nodeConfig.prompt) {
-              dynamicPrompt += `\nStep Instructions: ${nodeConfig.prompt}`;
-            }
-            if (Object.keys(extractedVariables).length > 0) {
-              dynamicPrompt += `\nExtracted Variables: ${JSON.stringify(extractedVariables)}`;
+            if (nodeConfig.prompt) dynamicPrompt += `\nStep Instructions: ${nodeConfig.prompt}`;
+            if (Object.keys(settings.extractedVariables).length > 0) {
+              dynamicPrompt += `\nExtracted Variables: ${JSON.stringify(settings.extractedVariables)}`;
             }
           }
           dynamicPrompt += '\n\nContext:\n' + topChunk;
- 
           const messages = [
             { role: "system", content: dynamicPrompt },
             ...conversation,
           ];
- 
           const response = await aiResponse(
+            ws,
             messages,
             settings.aiModel,
             settings.temperature,
             settings.maxTokens
           );
- 
           console.log("🤖 AI response:", response);
- 
-          // Extract variables if plan exists
           if (currentNode?.config?.variableExtractionPlan) {
             const newVariables = await extractVariables(
               message.voicePrompt,
@@ -407,49 +340,22 @@ fastify.register(async function (fastify) {
             };
             console.log('📝 Extracted variables:', newVariables);
           }
-         
-          // Handle specific node types
-          if (currentNode?.type === 'api_request') {
-            console.log('🔄 Processing API request node');
-            // Implementation for API request node
-          } else if (currentNode?.type === 'transfer_call') {
-            console.log('📞 Processing transfer call node');
-            // Implementation for transfer call node
-          }
-         
-          // Determine next node
           if (workflow && currentNodeId) {
             const nextNodeId = determineNextNode(workflow, currentNodeId, response, message.voicePrompt);
             if (nextNodeId) {
               settings.currentNodeId = nextNodeId;
               console.log('⏭️ Moving to next node:', nextNodeId);
-             
-              // Check if next node is end_call - prepare for next interaction
-              const nextNode = workflow.nodes.find(n => n.id === nextNodeId);
-              if (nextNode?.type === 'end_call') {
-                console.log('⚠️ Next node is end_call, will terminate on next interaction');
-              }
             }
           }
- 
           conversation.push({ role: "assistant", content: response });
- 
-          ws.send(JSON.stringify({
-            type: "text",
-            token: response,
-            last: true,
-          }));
           break;
- 
         case "interrupt":
           console.log("🔕 Interrupt received.");
           break;
- 
         default:
           console.warn("⚠️ Unknown message type:", message.type);
       }
     });
- 
     ws.on("close", () => {
       console.log("🛑 WebSocket closed");
       sessions.delete(callSid);
@@ -457,7 +363,7 @@ fastify.register(async function (fastify) {
     });
   });
 });
- 
+
 try {
   await fastify.listen({ port: PORT, host: "0.0.0.0" });
   console.log(`🚀 Server running at http://0.0.0.0:${PORT} and wss://${DOMAIN}/ws`);
@@ -465,5 +371,3 @@ try {
   fastify.log.error(err);
   process.exit(1);
 }
- 
- 
