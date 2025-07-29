@@ -255,6 +255,87 @@ fastify.post("/end-call/:callSid", async (request, reply) => {
   }
 });
 
+fastify.post("/preview-agent", async (request, reply) => {
+  const {
+    agentId,
+    userInput,
+    aiModel,
+    temperature,
+    maxTokens,
+    systemPrompt,
+    firstMessage,
+  } = request.body;
+
+  try {
+    // Get the agent's workflow and knowledge base from Pinecone
+    const [workflow, knowledgeChunks] = await Promise.all([
+      getActiveWorkflowForAgent(agentId),
+      preFetchAgentKnowledge(agentId)
+    ]);
+
+    const startNode = workflow?.nodes?.find(n => !workflow.edges.some(e => e.to_node_id === n.id));
+    let currentNodeId = startNode?.id;
+    let extractedVariables = {};
+
+    // Build the dynamic prompt with knowledge base and current step
+    let dynamicPrompt = systemPrompt || "";
+    if (startNode) {
+      const nodeConfig = typeof startNode.config === 'string'
+        ? JSON.parse(startNode.config)
+        : startNode.config;
+      dynamicPrompt += `\n\nCurrent Step: ${startNode.name}`;
+      if (nodeConfig.prompt) dynamicPrompt += `\nStep Instructions: ${nodeConfig.prompt}`;
+    }
+
+    // Combine all knowledge chunks, not just the first
+    const knowledgeContext = knowledgeChunks.map(chunk => chunk.content).join("\n\n");
+    dynamicPrompt += '\n\nKnowledge Base:\n' + knowledgeContext;
+
+    // Build conversation messages
+    const messages = [
+      { role: "system", content: dynamicPrompt },
+      { role: "assistant", content: firstMessage || "How can I help you today?" },
+      { role: "user", content: userInput }
+    ];
+
+    // Get AI response from OpenAI
+    const completion = await openai.chat.completions.create({
+      model: aiModel || "gpt-4",
+      temperature: temperature !== undefined ? parseFloat(temperature) : 0.7,
+      max_tokens: maxTokens !== undefined ? parseInt(maxTokens, 10) : 256,
+      messages
+    });
+
+    const aiReply = completion.choices[0].message.content;
+
+    // Extract variables if configured in the first node
+    if (startNode?.config?.variableExtractionPlan) {
+      const newVariables = await extractVariables(
+        userInput,
+        startNode.config.variableExtractionPlan
+      );
+      extractedVariables = { ...extractedVariables, ...newVariables };
+    }
+
+    // Determine next node for multi-turn preview
+    let nextNodeId = null;
+    if (workflow && currentNodeId) {
+      nextNodeId = determineNextNode(workflow, currentNodeId, aiReply, userInput);
+    }
+
+    // Return AI reply and extracted variables
+    reply.send({
+      success: true,
+      aiReply,
+      extractedVariables,
+      nextNodeId
+    });
+  } catch (err) {
+    console.error("❌ Failed to preview agent:", err);
+    reply.code(500).send({ error: "Failed to preview agent", details: err.message });
+  }
+});
+
 fastify.register(workflowRoutes, { prefix: '/api' });
 
 fastify.register(async function (fastify) {
@@ -364,6 +445,167 @@ fastify.register(async function (fastify) {
   });
 });
 
+
+fastify.register(async function (fastify) {
+  fastify.get("/preview-agent-ws", { websocket: true }, (ws, req) => {
+    const sessionId = req.query.sessionId || `preview-${Date.now()}`; // Unique session ID for preview
+    console.log(`⚙️ WebSocket setup for preview session: ${sessionId}`);
+
+    ws.on("message", async (data) => {
+      try {
+        const message = JSON.parse(data);
+        switch (message.type) {
+          case "ping":
+            ws.send(JSON.stringify({ type: "pong" }));
+            break;
+          case "setup":
+            // Initialize session with provided settings
+            const {
+              agentId,
+              aiModel,
+              temperature,
+              maxTokens,
+              systemPrompt,
+              firstMessage,
+            } = message.payload;
+            // Initialize conversation with firstMessage
+            sessions.set(sessionId, [{ role: "assistant", content: firstMessage || "How can I help you today?" }]);
+            callSettings.set(sessionId, {
+              agentId,
+              aiModel: aiModel || "gpt-4",
+              temperature: parseFloat(temperature) || 0.7,
+              maxTokens: parseInt(maxTokens, 10) || 256,
+              systemPrompt: systemPrompt || "You are a helpful AI agent designed for phone-like conversations.",
+              firstMessage,
+              extractedVariables: {},
+              workflow: null,
+              currentNodeId: null,
+              knowledgeChunks: [],
+            });
+
+            // Pre-fetch workflow and knowledge
+            const [workflow, knowledgeChunks] = await Promise.all([
+              getActiveWorkflowForAgent(agentId),
+              preFetchAgentKnowledge(agentId),
+            ]);
+            const startNode = workflow?.nodes?.find(
+              (n) => !workflow.edges.some((e) => e.to_node_id === n.id)
+            );
+            callSettings.get(sessionId).workflow = workflow;
+            callSettings.get(sessionId).currentNodeId = startNode?.id;
+            callSettings.get(sessionId).knowledgeChunks = knowledgeChunks;
+
+            console.log(`⚙️ Preview session setup for agentId: ${agentId}`);
+            ws.send(JSON.stringify({ type: "setup", success: true, sessionId }));
+            // Removed: ws.send(JSON.stringify({ type: "text", token: firstMessage, last: true }));
+            break;
+
+          case "prompt":
+            const { userInput } = message;
+            console.log(`🎤 Preview prompt: ${userInput}`);
+            const settings = callSettings.get(sessionId);
+            if (!settings) {
+              ws.send(
+                JSON.stringify({
+                  type: "error",
+                  message: "Session not found. Please start a new session.",
+                })
+              );
+              return;
+            }
+
+            const conversation = sessions.get(sessionId) || [];
+            conversation.push({ role: "user", content: userInput });
+
+            const currentWorkflow = settings.workflow;
+            const currentNodeId = settings.currentNodeId;
+            const currentKnowledgeChunks = settings.knowledgeChunks;
+            const currentNode = currentWorkflow?.nodes?.find((n) => n.id === currentNodeId);
+
+            // Build dynamic prompt
+            let dynamicPrompt = settings.systemPrompt;
+            if (currentNode) {
+              const nodeConfig =
+                typeof currentNode.config === "string"
+                  ? JSON.parse(currentNode.config)
+                  : currentNode.config;
+              dynamicPrompt += `\n\nCurrent Step: ${currentNode.name}`;
+              if (nodeConfig.prompt) dynamicPrompt += `\nStep Instructions: ${nodeConfig.prompt}`;
+              if (Object.keys(settings.extractedVariables).length > 0) {
+                dynamicPrompt += `\nExtracted Variables: ${JSON.stringify(
+                  settings.extractedVariables
+                )}`;
+              }
+            }
+
+            const combinedKnowledge = currentKnowledgeChunks.map(chunk => chunk.content).join("\n\n");
+            dynamicPrompt += "\n\nContext:\n" + combinedKnowledge;
+            const messages = [
+              { role: "system", content: dynamicPrompt },
+              ...conversation,
+            ];
+
+            // Stream AI response
+            const response = await aiResponse(
+              ws,
+              messages,
+              settings.aiModel,
+              settings.temperature,
+              settings.maxTokens
+            );
+            console.log("🤖 AI response:", response);
+
+            // Extract variables if needed
+            if (currentNode?.config?.variableExtractionPlan) {
+              const newVariables = await extractVariables(
+                userInput,
+                currentNode.config.variableExtractionPlan
+              );
+              settings.extractedVariables = {
+                ...settings.extractedVariables,
+                ...newVariables,
+              };
+              console.log("📝 Extracted variables:", newVariables);
+            }
+
+            // Determine next node
+            if (currentWorkflow && currentNodeId) {
+              const nextNodeId = determineNextNode(currentWorkflow, currentNodeId, response, userInput);
+              if (nextNodeId) {
+                settings.currentNodeId = nextNodeId;
+                console.log(`⏭️ Moving to next node: ${nextNodeId}`);
+              }
+            }
+
+            conversation.push({ role: "assistant", content: response });
+            sessions.set(sessionId, conversation);
+            break;
+
+          case "end":
+            console.log(`🛑 Preview session ended: ${sessionId}`);
+            sessions.delete(sessionId);
+            callSettings.delete(sessionId);
+            ws.close();
+            break;
+
+          default:
+            console.warn(`⚠️ Unknown message type: ${message.type}`);
+        }
+      } catch (err) {
+        console.error("❌ WebSocket error:", err);
+        ws.send(
+          JSON.stringify({ type: "error", message: `Error: ${err.message}` })
+        );
+      }
+    });
+
+    ws.on("close", () => {
+      console.log(`🛑 WebSocket closed for session: ${sessionId}`);
+      sessions.delete(sessionId);
+      callSettings.delete(sessionId);
+    });
+  });
+});
 try {
   await fastify.listen({ port: PORT, host: "0.0.0.0" });
   console.log(`🚀 Server running at http://0.0.0.0:${PORT} and wss://${DOMAIN}/ws`);
